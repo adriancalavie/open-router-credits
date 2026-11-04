@@ -1,0 +1,15 @@
+[package]
+name = "open-router-credits"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Compact htop-style terminal dashboard for OpenRouter credits"
+
+[dependencies]
+crossterm = "0.29.0"
+dirs = "7.0.0"
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.2.0"
+ureq = "3.5.1"
