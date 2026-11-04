@@ -1,5 +1,7 @@
 # open-router-credits
 
+[![CI](https://github.com/adriancalavie/open-router-credits/actions/workflows/rust.yml/badge.svg?branch=main&label=CI)](https://github.com/adriancalavie/open-router-credits/actions/workflows/rust.yml)
+
 Shows your OpenRouter credit balance in the terminal.
 
 ```
