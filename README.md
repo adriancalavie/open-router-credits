@@ -68,7 +68,11 @@ open-router-credits --config <PATH>   # use another config file
 ```
 
 Press `q` to quit, `r` to refresh, `0`-`7` to switch the window, and `?` for help. It needs
-60 columns and 12 rows.
+16 columns and 5 rows (4 in window mode). It gives up information only when it runs out of room,
+one thing at a time: the footer, the bar, the blank line, the header, then within a row the
+SHARE/RATE column (around 31 columns), the dollar sign (around 20, and only while the header
+still says USD), then label length. Labels shorten before they are cut. The numbers are the
+last thing to go.
 
 ## Windows
 

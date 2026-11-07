@@ -12,7 +12,7 @@
 //! width with its value at the end, so the right edge never looks ragged.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table};
@@ -20,14 +20,15 @@ use std::time::Instant;
 
 use crate::app::App;
 use crate::format::{
-    bar_spans, days, left_color, masked_key, money, percent, rate, remaining_color,
+    Cash, bar_spans, cash, column_decimals, days, left_color, masked_key, percent, rate_with,
+    remaining_color,
 };
 use crate::range::Range;
 
-const MIN_WIDTH: u16 = 60;
-const MIN_HEIGHT: u16 = 12;
+const MIN_WIDTH: u16 = 16;
 const PANEL_WIDTH: u16 = 76;
-const PANEL_HEIGHT: u16 = 12;
+/// Below this the bar loses more than it explains.
+const GAUGE_MIN_WIDTH: u16 = 22;
 
 fn faint() -> Style {
     Style::default().add_modifier(Modifier::DIM)
@@ -59,78 +60,197 @@ fn badge() -> Style {
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let metrics: u16 = if app.range == Range::All { 3 } else { 2 };
+    let min_height = 2 + metrics;
+    let has_error = app.error.is_some() || app.spend_error.is_some();
 
-    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+    if area.width < MIN_WIDTH || area.height < min_height {
+        // Two short lines, because the reason this is on screen is a terminal
+        // that cannot hold much.
         let message = Paragraph::new(vec![
-            Line::from(Span::styled("open-router-credits", bold())),
-            Line::from(""),
-            Line::from(format!(
-                "terminal too small — need at least {MIN_WIDTH}x{MIN_HEIGHT}"
-            )),
+            Line::from(Span::styled("too small", bold())),
+            Line::from(format!("need {MIN_WIDTH}x{min_height}")),
         ])
         .alignment(Alignment::Center);
-        frame.render_widget(message, centered(area, area.width.min(48), 3));
+        frame.render_widget(message, centered(area, area.width.min(48), 2));
         return;
     }
 
+    // Shed rows until the frame fits: footer, then gauge, then the table
+    // header, then the blank line under the title. The metric rows are the
+    // only thing that never goes.
     let width = area.width.min(PANEL_WIDTH);
-    // A window drops the "Purchased" row, so the frame shrinks with it.
-    let height = if app.range == Range::All {
-        PANEL_HEIGHT
-    } else {
-        PANEL_HEIGHT - 1
-    };
-    let panel = centered(area, width, height);
-    let inner = panel.inner(ratatui::layout::Margin::new(1, 1));
-    // Keep one column of breathing room so right-aligned values don't touch the border.
-    let content = Rect {
-        width: inner.width.saturating_sub(1),
-        ..inner
-    };
+    let plan = Plan {
+        pad: true,
+        header: true,
+        // A bar narrower than a few cells reads as noise, not as a gauge.
+        gauge: width >= GAUGE_MIN_WIDTH,
+        footer: true,
+        error: has_error,
+    }
+    .fit(metrics, area.height);
 
-    let title = match app.range {
-        Range::All => " open-router-credits ".to_string(),
-        range => format!(" open-router-credits · {} ", range.label()),
-    };
+    let panel = centered(area, width, plan.height(metrics));
+
+    // The title names the window when it can; the metric row then just says
+    // "Used" instead of repeating it.
+    let mut window_in_title = app.range != Range::All;
+    let mut title = format!(" open-router-credits · {} ", app.range.label());
+    if app.range == Range::All || (width as usize) <= title.chars().count() {
+        title = " open-router-credits ".to_string();
+        window_in_title = false;
+    }
+    if (width as usize) <= title.chars().count() {
+        title = " credits ".to_string();
+        window_in_title = false;
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(faint())
-        .title(Line::from(Span::styled(title, bold())));
+        .title(Line::from(Span::styled(title.clone(), bold())));
     frame.render_widget(block, panel);
 
     // Alerts live in the frame, not in a row of their own: the border carries
-    // state the way a window title does.
+    // state the way a window title does. It steps aside when the title and the
+    // badge would collide.
     if let Some(credits) = app.credits {
-        if credits.remaining() <= 0.0 {
-            draw_badge(frame, panel, "OUT OF CREDITS");
+        let label = if credits.remaining() <= 0.0 {
+            Some("OUT OF CREDITS")
         } else if credits.remaining() < 5.0 {
-            draw_badge(frame, panel, "LOW BALANCE");
+            Some("LOW BALANCE")
+        } else {
+            None
+        };
+        if let Some(label) = label
+            && width as usize >= title.chars().count() + label.chars().count() + 4
+        {
+            draw_badge(frame, panel, label);
         }
     }
 
-    let rows = Layout::vertical([
-        Constraint::Length(1), // breathing room under the frame
-        // Three rows for a window, four for the lifetime view: the spare line
-        // is dropped rather than left as a gap under the table.
-        Constraint::Length(if app.range == Range::All { 4 } else { 3 }),
-        Constraint::Length(1), // spacer
-        Constraint::Length(1), // gauge
-        Constraint::Length(1), // spacer
-        Constraint::Length(1), // footer
-        Constraint::Min(1),    // error (only when present)
-    ])
-    .split(content);
+    // One column of air inside the borders, so right-aligned values never touch
+    // the frame.
+    let content = Rect {
+        x: panel.x + 1,
+        y: panel.y + 1,
+        width: panel.width.saturating_sub(3),
+        height: 0,
+    };
 
-    draw_table(frame, rows[1], app);
-    draw_gauge(frame, rows[3], app);
-    draw_footer(frame, rows[5], app);
-    if app.error.is_some() || app.spend_error.is_some() {
-        draw_error(frame, rows[6], app);
+    let mut y = panel.y + 1;
+    if plan.pad {
+        y += 1;
+    }
+    let table_height = metrics + u16::from(plan.header);
+    draw_table(
+        frame,
+        Rect {
+            y,
+            height: table_height,
+            ..content
+        },
+        app,
+        plan.header,
+        window_in_title,
+    );
+    y += table_height;
+    if plan.gauge {
+        y += 1;
+        draw_gauge(
+            frame,
+            Rect {
+                y,
+                height: 1,
+                ..content
+            },
+            app,
+        );
+        y += 1;
+    }
+    if plan.footer {
+        y += 1;
+        draw_footer(
+            frame,
+            Rect {
+                y,
+                height: 1,
+                ..content
+            },
+            app,
+        );
+        y += 1;
+    }
+    if plan.error {
+        draw_error(
+            frame,
+            Rect {
+                y,
+                height: 1,
+                ..content
+            },
+            app,
+        );
     }
 
     if app.show_help {
         draw_help(frame, area, app);
+    }
+}
+
+/// Which optional rows the frame can afford.
+#[derive(Debug, Clone, Copy)]
+struct Plan {
+    pad: bool,
+    header: bool,
+    gauge: bool,
+    footer: bool,
+    error: bool,
+}
+
+impl Plan {
+    /// Height of the whole frame for this set of rows, borders included.
+    fn height(self, metrics: u16) -> u16 {
+        2 + u16::from(self.pad)
+            + metrics
+            + u16::from(self.header)
+            + if self.gauge { 2 } else { 0 }
+            + if self.footer { 2 } else { 0 }
+            + u16::from(self.error)
+    }
+
+    /// Drops the least useful row until the frame fits the terminal.
+    fn fit(mut self, metrics: u16, available: u16) -> Self {
+        while self.height(metrics) > available {
+            self = if self.footer {
+                Self {
+                    footer: false,
+                    ..self
+                }
+            } else if self.gauge {
+                Self {
+                    gauge: false,
+                    ..self
+                }
+            } else if self.pad {
+                // Decorative padding goes before the header: a blank line is
+                // worth less than a column label.
+                Self { pad: false, ..self }
+            } else if self.header {
+                Self {
+                    header: false,
+                    ..self
+                }
+            } else if self.error {
+                Self {
+                    error: false,
+                    ..self
+                }
+            } else {
+                break;
+            };
+        }
+        self
     }
 }
 
@@ -149,133 +269,200 @@ fn draw_badge(frame: &mut Frame, panel: Rect, label: &str) {
     );
 }
 
-fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_table(frame: &mut Frame, area: Rect, app: &App, show_header: bool, window_in_title: bool) {
     // The lifetime view reports shares of purchases. A window cannot: that
     // denominator grows forever, so the same row carries a burn rate instead.
     let windowed = app.range != Range::All;
-    let header = Row::new(vec![
-        Cell::from("METRIC"),
-        Cell::from(Line::from("USD").right_aligned()),
-        Cell::from(Line::from(if windowed { "RATE" } else { "SHARE" }).right_aligned()),
-    ])
-    .style(faint_bold());
-
     let purchased = app.credits.map(|c| c.total_credits).unwrap_or(0.0);
     let remaining = app.credits.map(|c| c.remaining()).unwrap_or(0.0);
-    let remaining_fraction = app.credits.and_then(|credits| credits.remaining_fraction());
     let remain_color = app
         .credits
         .map(|credits| remaining_color(&credits))
         .unwrap_or(Color::Yellow);
-
-    // Share is always "of everything ever purchased", so numbers stay
-    // comparable between the lifetime view and a window.
     let share_of_purchased =
-        |amount: f64| (purchased > 0.0).then(|| (amount / purchased).clamp(0.0, 1.0));
+        |value: f64| (purchased > 0.0).then(|| (value / purchased).clamp(0.0, 1.0));
+
+    // One precision for the whole column, so the decimal points line up: a
+    // sub-dollar value lifts its neighbours to four decimals instead of
+    // leaving a ragged right edge.
+    let decimals = column_decimals(
+        [
+            purchased,
+            app.credits.map(|c| c.total_usage).unwrap_or(0.0),
+            app.window_spend().unwrap_or(0.0),
+            remaining,
+        ],
+        4,
+    );
+
+    // Everything the panel wants to show, in one budget. Each rung gives up the
+    // least useful thing that still fits: the third column first (a whole
+    // metric is worth more than one character), then the dollar sign (redundant
+    // while the header says USD), then label length, then digits via 1.2k.
+    let values = [
+        purchased,
+        app.credits.map(|c| c.total_usage).unwrap_or(0.0),
+        app.window_spend().unwrap_or(0.0),
+        remaining,
+    ];
+    let width_of = |style| {
+        values
+            .iter()
+            .map(|value| cash(*value, decimals, style).chars().count())
+            .max()
+            .unwrap_or(0)
+    };
+    let (full, bare, compact) = (
+        width_of(Cash::Full),
+        width_of(Cash::Bare),
+        width_of(Cash::Compact),
+    );
+    let third_width = if windowed { 9 + 2 } else { 8 + 2 };
+    let cols = area.width as usize;
+    let fits = |amount: usize, label: usize, third: bool| {
+        amount + 2 + label + if third { third_width } else { 0 } <= cols
+    };
+    // Nine columns is "Remaining", the longest label; four is a readable stub.
+    // With the header on screen the dollar sign is the cheapest thing to lose,
+    // so it goes before any label is shortened. Without it the numbers carry the
+    // unit, so labels give way first.
+    let (style, show_third, label_width) = if fits(full, 9, true) {
+        (Cash::Full, true, cols - full - 2 - third_width)
+    } else if fits(full, 9, false) {
+        (Cash::Full, false, cols - full - 2)
+    } else if show_header && fits(bare, 4, false) {
+        // The header carries the unit, so the sign goes before any label is
+        // shortened. Whatever space is left is the label's.
+        (Cash::Bare, false, cols - bare - 2)
+    } else if fits(full, 4, false) {
+        (Cash::Full, false, cols - full - 2)
+    } else if fits(bare, 4, false) {
+        (Cash::Bare, false, cols - bare - 2)
+    } else {
+        (Cash::Compact, false, cols.saturating_sub(compact + 2))
+    };
+
+    // `None` means the window query has not answered yet, not zero.
+    let amount_text = |value: Option<f64>| {
+        value
+            .map(|value| cash(value, decimals, style))
+            .unwrap_or_else(|| "\u{2026}".to_string())
+    };
+    let purchased_text = amount_text(Some(purchased));
+    let lifetime_text = amount_text(app.credits.map(|c| c.total_usage));
+    let window_text = amount_text(app.window_spend());
+    let remaining_text = amount_text(Some(remaining));
+
+    // The USD column is sized to the widest amount actually shown, so a panel
+    // that prints "$74.75" does not reserve room for "$1,234,567.89".
+    let amount_width = [
+        &purchased_text,
+        &lifetime_text,
+        &window_text,
+        &remaining_text,
+    ]
+    .iter()
+    .map(|text| text.chars().count())
+    .max()
+    .unwrap_or(5)
+    .clamp(5, 12) as u16;
+
+    let used_label = if window_in_title {
+        // The frame already names the window, so repeating it in the row would
+        // print the same thing twice.
+        elide("Used", label_width)
+    } else {
+        let full = format!("Used \u{b7} {}", app.range.label());
+        if full.chars().count() <= label_width {
+            full
+        } else {
+            elide(app.range.short_label(), label_width)
+        }
+    };
 
     let label = |text: String| Cell::from(Line::from(Span::styled(text, faint())));
-    let amount = |value: Option<f64>| {
-        // `None` means the window query has not answered yet, not zero.
-        let text = value.map(money).unwrap_or_else(|| "…".to_string());
-        Cell::from(Line::from(Span::styled(text, bold())).right_aligned())
-    };
-    let share = |fraction: Option<f64>| {
+    let amount =
+        |text: &str| Cell::from(Line::from(Span::styled(text.to_string(), bold())).right_aligned());
+    let note = |text: String| Cell::from(Line::from(Span::styled(text, faint())).right_aligned());
+    let share =
+        |fraction: Option<f64>| note(fraction.map(percent).unwrap_or_else(|| "\u{2014}".into()));
+    let remain_cell = || {
         Cell::from(
             Line::from(Span::styled(
-                fraction.map(percent).unwrap_or_else(|| "—".into()),
-                faint(),
+                remaining_text.clone(),
+                tint(app.color, remain_color).add_modifier(Modifier::BOLD),
             ))
             .right_aligned(),
         )
     };
 
     let mut rows = Vec::new();
-    if app.range == Range::All {
-        rows.push(Row::new(vec![
-            label("Purchased".into()),
-            amount(Some(purchased)),
-            share(share_of_purchased(purchased)),
-        ]));
-        rows.push(Row::new(vec![
-            label("Used".into()),
-            amount(app.credits.map(|c| c.total_usage)),
-            share(app.credits.and_then(|c| c.used_fraction())),
-        ]));
-    } else {
+    if windowed {
         // A window replaces the lifetime "Used" row instead of adding to it:
         // the question changes from "how much in total" to "how much lately".
-        let window = app.window_spend();
-        let price = |value: Option<f64>| {
-            Cell::from(
-                Line::from(Span::styled(
-                    value.map(rate).unwrap_or_else(|| "—".into()),
-                    faint(),
-                ))
-                .right_aligned(),
-            )
-        };
-        rows.push(Row::new(vec![
-            label(format!("Used · {}", app.range.label())),
-            amount(window),
-            price(app.burn_rate()),
-        ]));
-        // The rest of the row keeps its plain meaning: USD, then the runway
-        // that the burn rate implies.
-        rows.push(Row::new(vec![
-            label("Remaining".into()),
-            Cell::from(
-                Line::from(Span::styled(
-                    money(remaining),
-                    tint(app.color, remain_color).add_modifier(Modifier::BOLD),
-                ))
-                .right_aligned(),
-            ),
-            Cell::from(
-                Line::from(Span::styled(
-                    app.runway_days().map(days).unwrap_or_else(|| "—".into()),
-                    faint(),
-                ))
-                .right_aligned(),
-            ),
-        ]));
+        let mut cells = vec![label(used_label), amount(&window_text)];
+        if show_third {
+            let rate_decimals = column_decimals(app.burn_rate(), 3);
+            cells.push(note(
+                app.burn_rate()
+                    .map(|rate| rate_with(rate, rate_decimals))
+                    .unwrap_or_else(|| "\u{2014}".into()),
+            ));
+        }
+        rows.push(Row::new(cells));
 
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Fill(1),
-                Constraint::Length(12),
-                Constraint::Length(9),
-            ],
-        )
-        .header(header)
-        .column_spacing(2);
-        frame.render_widget(table, area);
-        return;
+        let mut cells = vec![label(elide("Remaining", label_width)), remain_cell()];
+        if show_third {
+            cells.push(note(
+                app.runway_days()
+                    .map(days)
+                    .unwrap_or_else(|| "\u{2014}".into()),
+            ));
+        }
+        rows.push(Row::new(cells));
+    } else {
+        let mut cells = vec![
+            label(elide("Purchased", label_width)),
+            amount(&purchased_text),
+        ];
+        if show_third {
+            cells.push(share(share_of_purchased(purchased)));
+        }
+        rows.push(Row::new(cells));
+
+        let mut cells = vec![label(elide("Used", label_width)), amount(&lifetime_text)];
+        if show_third {
+            cells.push(share(app.credits.and_then(|c| c.used_fraction())));
+        }
+        rows.push(Row::new(cells));
+
+        let mut cells = vec![label(elide("Remaining", label_width)), remain_cell()];
+        if show_third {
+            cells.push(share(app.credits.and_then(|c| c.remaining_fraction())));
+        }
+        rows.push(Row::new(cells));
     }
-    rows.push(Row::new(vec![
-        label("Remaining".into()),
-        Cell::from(
-            Line::from(Span::styled(
-                money(remaining),
-                tint(app.color, remain_color).add_modifier(Modifier::BOLD),
-            ))
-            .right_aligned(),
-        ),
-        share(remaining_fraction),
-    ]));
 
-    // The label column absorbs the slack, so both numeric columns stay pinned
-    // to the same right edge as the gauge value below.
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Fill(1),
-            Constraint::Length(12),
-            Constraint::Length(8),
-        ],
-    )
-    .header(header)
-    .column_spacing(2);
+    let mut header_cells = vec![
+        Cell::from(elide("METRIC", label_width)),
+        Cell::from(Line::from("USD").right_aligned()),
+    ];
+    if show_third {
+        header_cells.push(Cell::from(
+            Line::from(if windowed { "RATE" } else { "SHARE" }).right_aligned(),
+        ));
+    }
+
+    // The label column absorbs the slack, so the numeric columns stay pinned to
+    // the same right edge as the gauge value below.
+    let mut widths = vec![Constraint::Fill(1), Constraint::Length(amount_width)];
+    if show_third {
+        widths.push(Constraint::Length(if windowed { 9 } else { 8 }));
+    }
+    let mut table = Table::new(rows, widths).column_spacing(2);
+    if show_header {
+        table = table.header(Row::new(header_cells).style(faint_bold()));
+    }
 
     frame.render_widget(table, area);
 }
@@ -296,7 +483,7 @@ fn draw_gauge(frame: &mut Frame, area: Rect, app: &App) {
     // narrower question: of the money that moved inside it (spent + balance),
     // how much is still there. Falling back to the lifetime reading keeps the
     // line honest while the window query is in flight.
-    let (fraction, note) = if app.range == Range::All {
+    let (fraction, long_note) = if app.range == Range::All {
         (credits.remaining_fraction(), " left")
     } else {
         (
@@ -310,8 +497,15 @@ fn draw_gauge(frame: &mut Frame, area: Rect, app: &App) {
             let value = percent(fraction);
             // Two brackets, one leading space before the value, the value, and
             // the note. The bar takes whatever is left so the line fills the grid.
-            let suffix = 1 + value.chars().count() + note.len();
-            let bar_width = area.width.saturating_sub(2 + suffix as u16) as usize;
+            let suffix = |note: &str| 1 + value.chars().count() + note.len();
+            // "left of spend" is the full story; a narrow panel gets "left" so
+            // the bar keeps a few cells to draw in.
+            let note = if (2 + 4 + suffix(long_note)) as u16 <= area.width {
+                long_note
+            } else {
+                " left"
+            };
+            let bar_width = area.width.saturating_sub(2 + suffix(note) as u16) as usize;
             let color = app.color.then(|| left_color(Some(fraction)));
 
             let mut spans = vec![Span::styled("[", faint())];
@@ -329,42 +523,82 @@ fn draw_gauge(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let left = Line::from(vec![
-        Span::styled(" q ", Style::default()),
-        Span::styled("quit   ", faint()),
-        Span::styled(" 0-7 ", Style::default()),
-        Span::styled("window   ", faint()),
-        Span::styled(" r ", Style::default()),
-        Span::styled("refresh   ", faint()),
-        Span::styled(" ? ", Style::default()),
-        Span::styled("help", faint()),
-    ]);
-
     // No key material on screen unless the user opens the help panel: a
     // permanent fingerprint ends up in screenshots and screen shares.
     let freshness = if app.in_flight && app.credits.is_none() {
-        "fetching…".to_string()
+        "fetching\u{2026}".to_string()
     } else if app.in_flight {
-        "refreshing…".to_string()
+        "refreshing\u{2026}".to_string()
     } else {
         match app.last_updated {
             Some(at) => format!("updated {}", ago(at)),
             None => "no data".to_string(),
         }
     };
-    let right = Line::from(Span::styled(
-        format!("{freshness} · auto {}s ", app.refresh_secs),
-        faint(),
-    ))
-    .right_aligned();
+    let full = format!("{freshness} \u{b7} auto {}s ", app.refresh_secs);
+    let age = format!("{freshness} ");
 
-    frame.render_widget(Paragraph::new(left.clone()), area);
-    // Two paragraphs share this line. On a narrow terminal the right-aligned
-    // half would land on top of the keys, so drop it rather than jumble them.
-    // One column of air keeps the two halves readable.
-    let needed = left.width() as u16 + right.width() as u16 + 1;
-    if needed <= area.width {
+    // Key hints, with the most expendable last. The right side sheds first: the
+    // age, then the auto-refresh, then the hints from help backwards.
+    let mut hints: Vec<(&'static str, &'static str)> = vec![
+        (" q ", "quit   "),
+        (" 0-7 ", "window   "),
+        (" r ", "refresh   "),
+        (" ? ", "help"),
+    ];
+    let mut right = Right::Full;
+    loop {
+        let left_width: usize = hints.iter().map(|(key, text)| key.len() + text.len()).sum();
+        let right_width = right
+            .text(&full, &age)
+            .map_or(0, |text| text.chars().count());
+        // One column of air between the two halves.
+        if left_width + right_width < area.width as usize {
+            break;
+        }
+        right = match right {
+            Right::Full => Right::Age,
+            Right::Age => Right::None,
+            Right::None if hints.len() > 1 => {
+                hints.pop();
+                Right::None
+            }
+            Right::None => break,
+        };
+    }
+
+    let spans: Vec<Span> = hints
+        .iter()
+        .flat_map(|(key, text)| {
+            [
+                Span::styled(*key, Style::default()),
+                Span::styled(*text, faint()),
+            ]
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    if let Some(text) = right.text(&full, &age) {
+        let right = Line::from(Span::styled(text, faint())).right_aligned();
         frame.render_widget(Paragraph::new(right), area);
+    }
+}
+
+/// The tail of the footer, kept as a ladder so each step can be dropped.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Right {
+    Full,
+    Age,
+    None,
+}
+
+impl Right {
+    fn text<'a>(self, full: &'a str, age: &'a str) -> Option<&'a str> {
+        match self {
+            Self::Full => Some(full),
+            Self::Age => Some(age),
+            Self::None => None,
+        }
     }
 }
 
@@ -444,6 +678,20 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
         .padding(ratatui::widgets::Padding::new(1, 1, 1, 1));
 
     frame.render_widget(Paragraph::new(lines).block(block), help);
+}
+
+/// Cuts `text` to `width` columns, marking the cut with an ellipsis. The table
+/// widget would otherwise slice the string with no hint that it did.
+fn elide(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    // No dangling space before the ellipsis: "this…", not "this …".
+    let keep: String = text.chars().take(width - 1).collect();
+    format!("{}…", keep.trim_end())
 }
 
 fn ago(at: Instant) -> String {
@@ -544,6 +792,47 @@ mod tests {
                 20
             )
         );
+    }
+
+    /// `cargo test preview_sweep -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn preview_sweep() {
+        let credits = Some(Credits {
+            total_credits: 100.5,
+            total_usage: 25.75,
+        });
+        for (w, h) in [
+            (90, 24),
+            (44, 10),
+            (33, 10),
+            (32, 10),
+            (31, 10),
+            (22, 10),
+            (21, 10),
+            (20, 10),
+            (16, 5),
+        ] {
+            println!("--- {w}x{h} ---");
+            println!("{}", render(&app(credits), w, h));
+        }
+        let mut session = windowed_app(
+            Range::Session,
+            Some(spend([5.68, 8.49, 8.49, 15.73, 18.55, 36.55])),
+        );
+        session.set_session_base(35.0);
+        for (w, h) in [(90, 24), (60, 12), (44, 8), (28, 5), (24, 9), (20, 4)] {
+            println!("--- session {w}x{h} ---");
+            println!("{}", render(&session, w, h));
+        }
+        let quarter = windowed_app(
+            Range::Quarter,
+            Some(spend([5.68, 8.49, 8.49, 15.73, 19.15, 36.55])),
+        );
+        for (w, h) in [(46, 4), (46, 5)] {
+            println!("--- quarter {w}x{h} ---");
+            println!("{}", render(&quarter, w, h));
+        }
     }
 
     /// `cargo test preview_window -- --ignored --nocapture`
@@ -699,7 +988,9 @@ mod tests {
             screen.contains("open-router-credits · this week"),
             "{screen}"
         );
-        assert!(screen.contains("Used · this week"), "{screen}");
+        assert!(screen.contains("this week"), "{screen}");
+        assert!(screen.contains("Used "), "{screen}");
+        assert!(!screen.contains("Used · this week"), "{screen}");
         assert!(screen.contains("$5.68"), "{screen}");
         assert!(screen.contains("$3.50"), "{screen}");
         assert!(!screen.contains("Purchased"), "{screen}");
@@ -762,7 +1053,8 @@ mod tests {
     fn pending_window_is_not_shown_as_zero() {
         let app = windowed_app(Range::Month, None);
         let screen = render(&app, 90, 24);
-        assert!(screen.contains("Used · this month"), "{screen}");
+        assert!(screen.contains("Used "), "{screen}");
+        assert!(screen.contains("this month"), "{screen}");
         assert!(screen.contains('…'), "{screen}");
         assert!(!screen.contains("$0.00"), "{screen}");
     }
@@ -773,7 +1065,8 @@ mod tests {
         let mut app = windowed_app(Range::Session, None);
         app.set_session_base(35.0);
         let screen = render(&app, 90, 24);
-        assert!(screen.contains("Used · this session"), "{screen}");
+        assert!(screen.contains("Used "), "{screen}");
+        assert!(screen.contains("this session"), "{screen}");
         assert!(screen.contains("$1.50"), "{screen}");
     }
 
@@ -791,8 +1084,194 @@ mod tests {
 
     #[test]
     fn degrades_gracefully_on_small_terminal() {
-        let screen = render(&app(None), 40, 8);
+        // 15 columns leaves no room for a label next to the amount.
+        let screen = render(&app(None), 15, 8);
         assert!(screen.contains("too small"), "{screen}");
+        // Four rows cannot hold three metrics and the border.
+        let screen = render(&app(None), 60, 4);
+        assert!(screen.contains("too small"), "{screen}");
+    }
+
+    /// The panel keeps reporting the numbers after everything else is gone.
+    #[test]
+    fn a_short_terminal_keeps_only_the_metrics() {
+        let screen = render(
+            &app(Some(Credits {
+                total_credits: 100.5,
+                total_usage: 25.75,
+            })),
+            60,
+            5,
+        );
+        assert!(screen.contains("$100.50"), "{screen}");
+        assert!(screen.contains("$74.75"), "{screen}");
+        // No header, no bar, no keys.
+        assert!(!screen.contains("METRIC"), "{screen}");
+        assert!(!screen.contains("% left"), "{screen}");
+        assert!(!screen.contains("quit"), "{screen}");
+    }
+
+    /// Sixteen columns is the floor: one label, one amount, one border.
+    #[test]
+    fn a_sliver_of_terminal_still_shows_the_numbers() {
+        let screen = render(
+            &app(Some(Credits {
+                total_credits: 100.5,
+                total_usage: 25.75,
+            })),
+            16,
+            5,
+        );
+        // No header here, so the numbers keep their dollar sign.
+        assert!(screen.contains("$100.50"), "{screen}");
+        assert!(screen.contains("$74.75"), "{screen}");
+        // The label is shortened to fit, and the cut is marked.
+        assert!(screen.contains('…'), "{screen}");
+    }
+
+    /// A sub-dollar amount lifts the whole money column, so the decimal points
+    /// line up instead of the column stepping in and out.
+    #[test]
+    fn a_sub_dollar_amount_lifts_the_whole_column() {
+        let app = windowed_app(
+            Range::Week,
+            Some(spend([0.0197, 8.49, 8.49, 15.73, 18.55, 36.55])),
+        );
+        let screen = render(&app, 90, 24);
+        assert!(screen.contains("$0.0197"), "{screen}");
+        assert!(screen.contains("$3.5000"), "{screen}");
+        assert!(screen.contains("$0.003/d"), "{screen}");
+
+        // Each money cell is the same width and breaks at the same offset, so
+        // the decimal points stack even though the bytes before them differ.
+        let amounts: Vec<&str> = screen
+            .lines()
+            .filter_map(|line| {
+                let dollar = line.find('$')?;
+                let rest = &line[dollar..];
+                let end = rest.find(' ').unwrap_or(rest.len());
+                let cell = &rest[..end];
+                (!cell.contains('/')).then_some(cell)
+            })
+            .collect();
+        assert_eq!(amounts, ["$0.0197", "$3.5000"], "{screen}");
+        assert!(
+            amounts.iter().all(|cell| cell.find('.') == Some(2)),
+            "{amounts:?}"
+        );
+    }
+
+    /// With the header off screen the unit has to come from the numbers, so the
+    /// dollar sign stays as long as it fits.
+    #[test]
+    fn a_hidden_header_keeps_the_dollar_sign() {
+        let app = windowed_app(
+            Range::Quarter,
+            Some(spend([5.68, 8.49, 8.49, 15.73, 19.15, 36.55])),
+        );
+        let screen = render(&app, 46, 4);
+        assert!(!screen.contains("METRIC"), "{screen}");
+        assert!(screen.contains("$19.15"), "{screen}");
+        assert!(screen.contains("$3.50"), "{screen}");
+    }
+
+    /// Past three integer digits a narrow panel trades digits for a suffix.
+    #[test]
+    fn a_large_balance_compacts_instead_of_widening_the_column() {
+        let app = app(Some(Credits {
+            total_credits: 12_345.67,
+            total_usage: 100.0,
+        }));
+        let screen = render(&app, 16, 5);
+        assert!(screen.contains("12k"), "{screen}");
+        assert!(!screen.contains("12,345"), "{screen}");
+    }
+
+    /// A narrow panel drops the "Used ·" prefix before it cuts the window name.
+    #[test]
+    fn a_narrow_window_uses_the_short_name() {
+        let mut app = windowed_app(Range::Session, None);
+        app.set_session_base(35.0);
+        let narrow = render(&app, 28, 5);
+        assert!(narrow.contains("session"), "{narrow}");
+        assert!(!narrow.contains("Used"), "{narrow}");
+
+        // Wide: the title carries the window, the row does not repeat it.
+        let wide = render(&app, 90, 24);
+        assert!(wide.contains("this session"), "{wide}");
+        assert!(!wide.contains("Used · this session"), "{wide}");
+    }
+
+    /// The label is measured, not left to the table widget, so a cut always
+    /// shows an ellipsis instead of a half word.
+    #[test]
+    fn elided_text_ends_with_an_ellipsis() {
+        assert_eq!(elide("this session", 12), "this session");
+        assert_eq!(elide("this session", 6), "this…");
+        assert_eq!(elide("this session", 1), "…");
+        assert_eq!(elide("this session", 0), "");
+    }
+
+    /// No label is cut at any supported size, the short name always fits.
+    #[test]
+    fn every_window_label_fits_at_the_minimum_width() {
+        for range in Range::ASKED.iter().chain([Range::Session].iter()) {
+            let mut app =
+                windowed_app(*range, Some(spend([5.68, 8.49, 8.49, 15.73, 18.55, 36.55])));
+            app.set_session_base(35.0);
+            let screen = render(&app, 28, 5);
+            assert!(screen.contains(range.short_label()), "{range}: {screen}");
+            assert!(!screen.contains('…'), "{range}: {screen}");
+        }
+    }
+
+    #[test]
+    fn height_drops_rows_one_at_a_time() {
+        let credits = Some(Credits {
+            total_credits: 100.5,
+            total_usage: 25.75,
+        });
+        // 7 rows: header + metrics, the bar is the next thing to go.
+        let screen = render(&app(credits), 90, 7);
+        assert!(screen.contains("METRIC"), "{screen}");
+        assert!(!screen.contains("quit"), "{screen}");
+        assert!(!screen.contains("% left"), "{screen}");
+
+        // 9 rows fits the bar but still not the keys.
+        let screen = render(&app(credits), 90, 9);
+        assert!(screen.contains("% left"), "{screen}");
+        assert!(!screen.contains("quit"), "{screen}");
+
+        // 11 rows is the lifetime panel complete.
+        let screen = render(&app(credits), 90, 11);
+        assert!(screen.contains("quit"), "{screen}");
+    }
+
+    /// Each thing leaves at its own width: the third column first, then the
+    /// dollar sign, then label length.
+    #[test]
+    fn wide_panels_drop_columns_and_signs_one_at_a_time() {
+        let credits = Some(Credits {
+            total_credits: 100.5,
+            total_usage: 25.75,
+        });
+        // 31 columns still pays for label + $100.50 + SHARE.
+        let screen = render(&app(credits), 31, 12);
+        assert!(screen.contains("SHARE"), "{screen}");
+        assert!(screen.contains("$74.75"), "{screen}");
+
+        // One column less and only the third column goes: the sign stays,
+        // because there is plenty of room left for it.
+        let screen = render(&app(credits), 30, 12);
+        assert!(!screen.contains("SHARE"), "{screen}");
+        assert!(screen.contains("$74.75"), "{screen}");
+        assert!(screen.contains("Remaining"), "{screen}");
+
+        // The sign only goes when it is competing with the label itself.
+        let screen = render(&app(credits), 20, 12);
+        assert!(!screen.contains('$'), "{screen}");
+        assert!(screen.contains("74.75"), "{screen}");
+        assert!(screen.contains("Remaining"), "{screen}");
     }
 
     /// The keys survive on a narrow terminal; the freshness text steps aside
@@ -807,6 +1286,30 @@ mod tests {
         let narrow = render(&app, 60, 24);
         assert!(narrow.contains("0-7 window"), "{narrow}");
         assert!(!narrow.contains("auto 60s"), "{narrow}");
+    }
+
+    /// Hints go in the order help, refresh, window; quit is the last one left.
+    #[test]
+    fn the_footer_sheds_hints_from_the_right() {
+        let app = app(Some(Credits {
+            total_credits: 100.5,
+            total_usage: 25.75,
+        }));
+        let screen = render(&app, 44, 12);
+        assert!(screen.contains("0-7 window"), "{screen}");
+        assert!(screen.contains("refresh"), "{screen}");
+        assert!(!screen.contains("? help"), "{screen}");
+
+        let screen = render(&app, 37, 12);
+        assert!(screen.contains("0-7 window"), "{screen}");
+        assert!(!screen.contains("refresh"), "{screen}");
+
+        // At the narrowest supported width, quit and the window keys remain.
+        let screen = render(&app, 30, 12);
+        assert!(screen.contains("quit"), "{screen}");
+        assert!(screen.contains("0-7 window"), "{screen}");
+        assert!(!screen.contains("refresh"), "{screen}");
+        assert!(!screen.contains("? help"), "{screen}");
     }
 
     /// Structure must never be drawn in palette slots that themes remap:

@@ -47,6 +47,20 @@ impl Range {
         }
     }
 
+    /// Short form for the metric column when the panel is narrow.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Range::All => "all",
+            Range::Session => "session",
+            Range::Week => "week",
+            Range::Last7 => "7 days",
+            Range::Month => "month",
+            Range::Last30 => "30 days",
+            Range::Quarter => "quarter",
+            Range::Year => "year",
+        }
+    }
+
     /// The digit that selects this range. Kept next to `digit` sources so the
     /// footer, the help panel and the parser cannot drift apart.
     pub fn from_key(ch: char) -> Option<Self> {
