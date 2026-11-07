@@ -54,10 +54,16 @@ pub fn days(days: f64) -> String {
 
 /// Color used for a "remaining" reading: green, amber, red as the balance drops.
 pub fn remaining_color(credits: &Credits) -> Color {
-    match credits.used_fraction() {
+    left_color(credits.remaining_fraction())
+}
+
+/// Same rule, stated as what is left instead of what is spent: one threshold
+/// table serves the lifetime bar, the window bar and overdraw alike.
+pub fn left_color(remaining: Option<f64>) -> Color {
+    match remaining {
         None => Color::DarkGray,
-        Some(used) if used >= 0.9 => Color::Red,
-        Some(used) if used >= 0.7 => Color::Yellow,
+        Some(left) if left <= 0.10 => Color::Red,
+        Some(left) if left <= 0.30 => Color::Yellow,
         Some(_) => Color::Green,
     }
 }
@@ -122,6 +128,10 @@ pub fn report(credits: &Credits, range: Range, spend: Option<f64>) -> String {
         let runway = per_day
             .filter(|rate| *rate > 0.0)
             .map(|rate| credits.remaining() / rate);
+        // The bar answers the same question as the TUI: of the money that moved
+        // inside this window, how much is still there.
+        let moved = window + credits.remaining().max(0.0);
+        let left = (moved > 0.0).then(|| credits.remaining().max(0.0) / moved);
         out.push_str(&format!(
             "{:<20} {:>12}  {:>7}\n",
             format!("Used · {}", range.label()),
@@ -133,7 +143,7 @@ pub fn report(credits: &Credits, range: Range, spend: Option<f64>) -> String {
             "Remaining",
             money(credits.remaining()),
             runway.map(days).unwrap_or_else(|| "—".into()),
-            bar_text(remaining, 24),
+            left.map(|f| bar_text(f, 24)).unwrap_or_default(),
         ));
         return out;
     }

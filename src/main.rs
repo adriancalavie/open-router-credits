@@ -55,6 +55,10 @@ WINDOWS:
     of balance left at that rate for the remaining row. A share of everything
     ever purchased says less the longer you use the account.
 
+    The bar follows the view: lifetime it is credit left of purchases, in a
+    window it is credit left of the money that moved inside the window
+    (remaining / (spent + remaining)).
+
 KEYS:
     q / esc  quit         r  refresh now          ?  help
     0-7      switch the reported window

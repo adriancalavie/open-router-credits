@@ -19,7 +19,9 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, 
 use std::time::Instant;
 
 use crate::app::App;
-use crate::format::{bar_spans, days, masked_key, money, percent, rate, remaining_color};
+use crate::format::{
+    bar_spans, days, left_color, masked_key, money, percent, rate, remaining_color,
+};
 use crate::range::Range;
 
 const MIN_WIDTH: u16 = 60;
@@ -279,25 +281,45 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_gauge(frame: &mut Frame, area: Rect, app: &App) {
-    let line = match app.credits.and_then(|credits| {
-        credits
-            .remaining_fraction()
-            .map(|fraction| (credits, fraction))
-    }) {
-        Some((credits, fraction)) => {
+    let Some(credits) = app.credits else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no credits purchased yet",
+                faint(),
+            ))),
+            area,
+        );
+        return;
+    };
+
+    // Lifetime asks "how much of everything I bought is left". A window asks a
+    // narrower question: of the money that moved inside it (spent + balance),
+    // how much is still there. Falling back to the lifetime reading keeps the
+    // line honest while the window query is in flight.
+    let (fraction, note) = if app.range == Range::All {
+        (credits.remaining_fraction(), " left")
+    } else {
+        (
+            app.window_left_fraction().or(credits.remaining_fraction()),
+            " left of spend",
+        )
+    };
+
+    let line = match fraction {
+        Some(fraction) => {
             let value = percent(fraction);
             // Two brackets, one leading space before the value, the value, and
-            // " left". The bar takes whatever is left so the line fills the grid.
-            let suffix = 1 + value.chars().count() + " left".len();
+            // the note. The bar takes whatever is left so the line fills the grid.
+            let suffix = 1 + value.chars().count() + note.len();
             let bar_width = area.width.saturating_sub(2 + suffix as u16) as usize;
-            let color = app.color.then(|| remaining_color(&credits));
+            let color = app.color.then(|| left_color(Some(fraction)));
 
             let mut spans = vec![Span::styled("[", faint())];
             spans.extend(bar_spans(fraction, bar_width, color));
             spans.push(Span::styled("]", faint()));
             spans.push(Span::raw(" "));
             spans.push(Span::styled(value, bold()));
-            spans.push(Span::styled(" left", faint()));
+            spans.push(Span::styled(note, faint()));
             Line::from(spans)
         }
         None => Line::from(Span::styled("no credits purchased yet", faint())),
@@ -691,6 +713,31 @@ mod tests {
         assert!(screen.contains("/d"), "{screen}");
         // 5.68 / 40.0 = 14.2%, the number this column used to print.
         assert!(!screen.contains("14.2%"), "{screen}");
+    }
+
+    /// The bar in a window measures what is left against the money that moved
+    /// inside it: 3.50 remaining / (3.50 + 5.68) = 38.1%.
+    #[test]
+    fn the_gauge_measures_what_is_left_of_the_window() {
+        let app = windowed_app(
+            Range::Week,
+            Some(spend([5.68, 8.49, 8.49, 15.73, 18.55, 36.55])),
+        );
+        let screen = render(&app, 90, 24);
+        assert!(screen.contains("38.1% left of spend"), "{screen}");
+        // The lifetime reading (8.8% of purchases left) must not appear.
+        assert!(!screen.contains("8.8% left"), "{screen}");
+    }
+
+    #[test]
+    fn the_lifetime_gauge_still_measures_purchases() {
+        let app = app(Some(Credits {
+            total_credits: 100.5,
+            total_usage: 25.75,
+        }));
+        let screen = render(&app, 90, 24);
+        assert!(screen.contains("74.4% left"), "{screen}");
+        assert!(!screen.contains("of spend"), "{screen}");
     }
 
     /// Under an hour the rate is noise, so the cell stays empty rather than

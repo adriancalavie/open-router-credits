@@ -144,6 +144,18 @@ impl App {
             .map(|credits| (credits.remaining() / rate).max(0.0))
     }
 
+    /// What is left as a share of the money that moved during the window:
+    /// everything spent inside it plus what still sits in the account.
+    /// `None` while the window query is still in flight.
+    /// This includes any top-up made inside the window, because the balance
+    /// does; the API has no way to tell the two apart.
+    pub fn window_left_fraction(&self) -> Option<f64> {
+        let spend = self.window_spend()?;
+        let remaining = self.credits?.remaining().max(0.0);
+        let moved = spend + remaining;
+        (moved > 0.0).then(|| remaining / moved)
+    }
+
     /// Seeds the session baseline without waiting for a first fetch. Only used
     /// by tests; in the app the baseline comes from the first `GET /credits`.
     #[cfg(test)]

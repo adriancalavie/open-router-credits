@@ -100,7 +100,12 @@ which one you are looking at.
 
 In the lifetime view `SHARE` is a slice of everything you ever purchased. In a window that
 column becomes `RATE`: dollars per day for the spend row, days of balance left for the
-remaining row. The bar keeps showing lifetime credit left.
+remaining row.
+
+The bar changes with the view too. Lifetime, it reads "how much of everything I bought is
+left". In a window it reads "how much of the money that moved inside this window is still
+there": remaining / (spent + remaining). Spent $5.68 since Monday with $3.50 left in the
+account, and $9.18 moved through the window, so 38.1% of it is left.
 
 Each window is one `POST /api/v1/analytics/query` with an exact start and end instant, so a
 window begins at your local midnight, not at a UTC day boundary. Windows refresh every five
