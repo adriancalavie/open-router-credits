@@ -19,7 +19,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, 
 use std::time::Instant;
 
 use crate::app::App;
-use crate::format::{bar_spans, masked_key, money, percent, remaining_color};
+use crate::format::{bar_spans, days, masked_key, money, percent, rate, remaining_color};
+use crate::range::Range;
 
 const MIN_WIDTH: u16 = 60;
 const MIN_HEIGHT: u16 = 12;
@@ -71,7 +72,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 
     let width = area.width.min(PANEL_WIDTH);
-    let panel = centered(area, width, PANEL_HEIGHT);
+    // A window drops the "Purchased" row, so the frame shrinks with it.
+    let height = if app.range == Range::All {
+        PANEL_HEIGHT
+    } else {
+        PANEL_HEIGHT - 1
+    };
+    let panel = centered(area, width, height);
     let inner = panel.inner(ratatui::layout::Margin::new(1, 1));
     // Keep one column of breathing room so right-aligned values don't touch the border.
     let content = Rect {
@@ -79,11 +86,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ..inner
     };
 
+    let title = match app.range {
+        Range::All => " open-router-credits ".to_string(),
+        range => format!(" open-router-credits · {} ", range.label()),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(faint())
-        .title(Line::from(Span::styled(" open-router-credits ", bold())));
+        .title(Line::from(Span::styled(title, bold())));
     frame.render_widget(block, panel);
 
     // Alerts live in the frame, not in a row of their own: the border carries
@@ -98,7 +109,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     let rows = Layout::vertical([
         Constraint::Length(1), // breathing room under the frame
-        Constraint::Length(4), // table: header + three rows
+        // Three rows for a window, four for the lifetime view: the spare line
+        // is dropped rather than left as a gap under the table.
+        Constraint::Length(if app.range == Range::All { 4 } else { 3 }),
         Constraint::Length(1), // spacer
         Constraint::Length(1), // gauge
         Constraint::Length(1), // spacer
@@ -110,7 +123,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_table(frame, rows[1], app);
     draw_gauge(frame, rows[3], app);
     draw_footer(frame, rows[5], app);
-    if app.error.is_some() {
+    if app.error.is_some() || app.spend_error.is_some() {
         draw_error(frame, rows[6], app);
     }
 
@@ -135,31 +148,35 @@ fn draw_badge(frame: &mut Frame, panel: Rect, label: &str) {
 }
 
 fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
+    // The lifetime view reports shares of purchases. A window cannot: that
+    // denominator grows forever, so the same row carries a burn rate instead.
+    let windowed = app.range != Range::All;
     let header = Row::new(vec![
         Cell::from("METRIC"),
         Cell::from(Line::from("USD").right_aligned()),
-        Cell::from(Line::from("SHARE").right_aligned()),
+        Cell::from(Line::from(if windowed { "RATE" } else { "SHARE" }).right_aligned()),
     ])
     .style(faint_bold());
 
-    let (purchased, used, remaining, used_fraction) = match app.credits {
-        Some(credits) => (
-            credits.total_credits,
-            credits.total_usage,
-            credits.remaining(),
-            credits.used_fraction(),
-        ),
-        None => (0.0, 0.0, 0.0, None),
-    };
+    let purchased = app.credits.map(|c| c.total_credits).unwrap_or(0.0);
+    let remaining = app.credits.map(|c| c.remaining()).unwrap_or(0.0);
     let remaining_fraction = app.credits.and_then(|credits| credits.remaining_fraction());
     let remain_color = app
         .credits
         .map(|credits| remaining_color(&credits))
         .unwrap_or(Color::Yellow);
 
-    let label = |text: &'static str| Cell::from(Line::from(Span::styled(text, faint())));
-    let amount =
-        |value: f64| Cell::from(Line::from(Span::styled(money(value), bold())).right_aligned());
+    // Share is always "of everything ever purchased", so numbers stay
+    // comparable between the lifetime view and a window.
+    let share_of_purchased =
+        |amount: f64| (purchased > 0.0).then(|| (amount / purchased).clamp(0.0, 1.0));
+
+    let label = |text: String| Cell::from(Line::from(Span::styled(text, faint())));
+    let amount = |value: Option<f64>| {
+        // `None` means the window query has not answered yet, not zero.
+        let text = value.map(money).unwrap_or_else(|| "…".to_string());
+        Cell::from(Line::from(Span::styled(text, bold())).right_aligned())
+    };
     let share = |fraction: Option<f64>| {
         Cell::from(
             Line::from(Span::styled(
@@ -170,15 +187,40 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
         )
     };
 
-    let rows = vec![
-        Row::new(vec![
-            label("Purchased"),
-            amount(purchased),
-            share(if purchased > 0.0 { Some(1.0) } else { None }),
-        ]),
-        Row::new(vec![label("Used"), amount(used), share(used_fraction)]),
-        Row::new(vec![
-            label("Remaining"),
+    let mut rows = Vec::new();
+    if app.range == Range::All {
+        rows.push(Row::new(vec![
+            label("Purchased".into()),
+            amount(Some(purchased)),
+            share(share_of_purchased(purchased)),
+        ]));
+        rows.push(Row::new(vec![
+            label("Used".into()),
+            amount(app.credits.map(|c| c.total_usage)),
+            share(app.credits.and_then(|c| c.used_fraction())),
+        ]));
+    } else {
+        // A window replaces the lifetime "Used" row instead of adding to it:
+        // the question changes from "how much in total" to "how much lately".
+        let window = app.window_spend();
+        let price = |value: Option<f64>| {
+            Cell::from(
+                Line::from(Span::styled(
+                    value.map(rate).unwrap_or_else(|| "—".into()),
+                    faint(),
+                ))
+                .right_aligned(),
+            )
+        };
+        rows.push(Row::new(vec![
+            label(format!("Used · {}", app.range.label())),
+            amount(window),
+            price(app.burn_rate()),
+        ]));
+        // The rest of the row keeps its plain meaning: USD, then the runway
+        // that the burn rate implies.
+        rows.push(Row::new(vec![
+            label("Remaining".into()),
             Cell::from(
                 Line::from(Span::styled(
                     money(remaining),
@@ -186,9 +228,39 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
                 ))
                 .right_aligned(),
             ),
-            share(remaining_fraction),
-        ]),
-    ];
+            Cell::from(
+                Line::from(Span::styled(
+                    app.runway_days().map(days).unwrap_or_else(|| "—".into()),
+                    faint(),
+                ))
+                .right_aligned(),
+            ),
+        ]));
+
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Fill(1),
+                Constraint::Length(12),
+                Constraint::Length(9),
+            ],
+        )
+        .header(header)
+        .column_spacing(2);
+        frame.render_widget(table, area);
+        return;
+    }
+    rows.push(Row::new(vec![
+        label("Remaining".into()),
+        Cell::from(
+            Line::from(Span::styled(
+                money(remaining),
+                tint(app.color, remain_color).add_modifier(Modifier::BOLD),
+            ))
+            .right_aligned(),
+        ),
+        share(remaining_fraction),
+    ]));
 
     // The label column absorbs the slack, so both numeric columns stay pinned
     // to the same right edge as the gauge value below.
@@ -238,6 +310,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let left = Line::from(vec![
         Span::styled(" q ", Style::default()),
         Span::styled("quit   ", faint()),
+        Span::styled(" 0-7 ", Style::default()),
+        Span::styled("window   ", faint()),
         Span::styled(" r ", Style::default()),
         Span::styled("refresh   ", faint()),
         Span::styled(" ? ", Style::default()),
@@ -267,23 +341,44 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_error(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(error) = &app.error else {
-        return;
+    // Balance errors win the single line: without a balance the panel is
+    // useless, while a failed window query still leaves the balance readable.
+    let (prefix, message) = match (&app.error, &app.spend_error) {
+        (Some(error), _) => (" ! ", error.clone()),
+        (None, Some(error)) => (" ! ", format!("spend {error}")),
+        (None, None) => return,
     };
     let line = Line::from(vec![
-        Span::styled(" ! ", badge()),
+        Span::styled(prefix, badge()),
         Span::raw(" "),
-        Span::styled(error.clone(), tint(app.color, Color::Red)),
+        Span::styled(message, tint(app.color, Color::Red)),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
-    let help = centered(area, area.width.min(58), 10);
+    let help = centered(area, area.width.min(62), 16);
     frame.render_widget(Clear, help);
 
     let key = |text: &'static str| Span::styled(text, Style::default());
     let text = |value: String| Span::styled(value, faint());
+
+    let window = match app.range {
+        Range::All => "all time · lifetime totals".to_string(),
+        range => format!("{} · {}", range.label(), range.since(chrono::Local::now())),
+    };
+    let spend = if app.spend_error.is_some() {
+        "unavailable".to_string()
+    } else {
+        match app.spend_updated {
+            Some(at) => format!(
+                "{} · auto {}m",
+                ago(at),
+                app.spend_interval().as_secs() / 60
+            ),
+            None => "not fetched yet".to_string(),
+        }
+    };
 
     let lines = vec![
         Line::from(Span::styled("keys", bold())),
@@ -291,6 +386,17 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![key(" q / esc "), text("close the dashboard".into())]),
         Line::from(vec![key(" r       "), text("refresh now".into())]),
         Line::from(vec![key(" ?       "), text("toggle this help".into())]),
+        Line::from(vec![
+            key(" 0-7     "),
+            text("window: 0 all · 1 session · 2 week".into()),
+        ]),
+        Line::from(vec![
+            key("         "),
+            text("3 7d · 4 month · 5 30d · 6 quarter · 7 year".into()),
+        ]),
+        Line::from(""),
+        Line::from(vec![key("window  "), text(window)]),
+        Line::from(vec![key("spend   "), text(spend)]),
         Line::from(""),
         Line::from(vec![
             key("config  "),
@@ -299,7 +405,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![key("key     "), text(masked_key(&app.cfg.api_key))]),
         Line::from(vec![
             key("source  "),
-            text("GET /api/v1/credits (management key)".into()),
+            text("GET /credits + POST /analytics/query".into()),
         ]),
     ];
 
@@ -343,9 +449,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn app(credits: Option<Credits>) -> App {
-        let mut app = App::new(
+        let mut app = App::with_range(
             Config::new("sk-or-v1-1234567890abcdef"),
             PathBuf::from("/tmp/config.toml"),
+            Range::All,
         );
         app.credits = credits;
         app.in_flight = false;
@@ -409,6 +516,17 @@ mod tests {
                 20
             )
         );
+    }
+
+    /// `cargo test preview_window -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn preview_window() {
+        let app = windowed_app(
+            Range::Week,
+            Some(spend([5.68, 8.49, 8.49, 15.73, 18.55, 36.55])),
+        );
+        println!("{}", render(&app, 90, 20));
     }
 
     /// `cargo test preview_error -- --ignored --nocapture`
@@ -521,6 +639,101 @@ mod tests {
         app.show_help = true;
         let screen = render(&app, 90, 24);
         assert!(screen.contains("toggle this help"), "{screen}");
+    }
+
+    fn windowed_app(range: Range, spend: Option<crate::range::Spend>) -> App {
+        let mut app = app(Some(Credits {
+            total_credits: 40.0,
+            total_usage: 36.5,
+        }));
+        app.range = range;
+        app.spend = spend;
+        app
+    }
+
+    fn spend(figures: [f64; 6]) -> crate::range::Spend {
+        let mut spend = crate::range::Spend::default();
+        for (range, value) in Range::ASKED.iter().zip(figures) {
+            spend.set(*range, value);
+        }
+        spend
+    }
+
+    /// A window replaces the lifetime "Used" row and keeps the balance intact.
+    #[test]
+    fn window_reports_spend_inside_the_range() {
+        let app = windowed_app(
+            Range::Week,
+            Some(spend([5.68, 8.49, 8.49, 15.73, 18.55, 36.55])),
+        );
+        let screen = render(&app, 90, 24);
+        assert!(
+            screen.contains("open-router-credits · this week"),
+            "{screen}"
+        );
+        assert!(screen.contains("Used · this week"), "{screen}");
+        assert!(screen.contains("$5.68"), "{screen}");
+        assert!(screen.contains("$3.50"), "{screen}");
+        assert!(!screen.contains("Purchased"), "{screen}");
+    }
+
+    /// A window must not report a share of lifetime purchases: that
+    /// denominator grows forever, so the row carries a burn rate instead.
+    #[test]
+    fn a_window_never_shows_a_lifetime_share() {
+        let app = windowed_app(
+            Range::Week,
+            Some(spend([5.68, 8.49, 8.49, 15.73, 18.55, 36.55])),
+        );
+        let screen = render(&app, 90, 24);
+        assert!(screen.contains("RATE"), "{screen}");
+        assert!(!screen.contains("SHARE"), "{screen}");
+        assert!(screen.contains("/d"), "{screen}");
+        // 5.68 / 40.0 = 14.2%, the number this column used to print.
+        assert!(!screen.contains("14.2%"), "{screen}");
+    }
+
+    /// Under an hour the rate is noise, so the cell stays empty rather than
+    /// projecting a five-minute window across a day.
+    #[test]
+    fn a_window_younger_than_an_hour_has_no_rate() {
+        let mut app = windowed_app(Range::Session, None);
+        app.set_session_base(35.0);
+        let screen = render(&app, 90, 24);
+        assert!(screen.contains("$1.50"), "{screen}");
+        assert!(!screen.contains("/d"), "{screen}");
+    }
+
+    /// Before the query answers, the row must read as pending, never as $0.00.
+    #[test]
+    fn pending_window_is_not_shown_as_zero() {
+        let app = windowed_app(Range::Month, None);
+        let screen = render(&app, 90, 24);
+        assert!(screen.contains("Used · this month"), "{screen}");
+        assert!(screen.contains('…'), "{screen}");
+        assert!(!screen.contains("$0.00"), "{screen}");
+    }
+
+    /// The session window is a counter delta, so it needs no analytics data.
+    #[test]
+    fn session_window_uses_the_lifetime_counter() {
+        let mut app = windowed_app(Range::Session, None);
+        app.set_session_base(35.0);
+        let screen = render(&app, 90, 24);
+        assert!(screen.contains("Used · this session"), "{screen}");
+        assert!(screen.contains("$1.50"), "{screen}");
+    }
+
+    #[test]
+    fn a_failed_window_query_keeps_the_balance_visible() {
+        let mut app = windowed_app(Range::Quarter, None);
+        app.spend_error = Some("analytics query rejected: bad time range".into());
+        let screen = render(&app, 90, 24);
+        assert!(screen.contains("$3.50"), "{screen}");
+        assert!(
+            screen.contains("spend analytics query rejected"),
+            "{screen}"
+        );
     }
 
     #[test]

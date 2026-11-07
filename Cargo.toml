@@ -6,6 +6,7 @@ rust-version = "1.88"
 description = "Compact htop-style terminal dashboard for OpenRouter credits"
 
 [dependencies]
+chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 crossterm = "0.29.0"
 dirs = "7.0.0"
 ratatui = "0.30.2"

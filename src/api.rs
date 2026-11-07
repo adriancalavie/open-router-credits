@@ -7,6 +7,9 @@ use ureq::Agent;
 
 pub const DEFAULT_API_BASE: &str = "https://openrouter.ai/api/v1";
 pub const MANAGEMENT_KEYS_URL: &str = "https://openrouter.ai/settings/management-keys";
+/// Largest response we will read. Both endpoints answer with a handful of
+/// hundred bytes, so the cap only exists to bound a broken or hostile server.
+const BODY_LIMIT: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Credits {
@@ -41,6 +44,9 @@ pub enum ApiError {
     Status(u16),
     Network(String),
     Decode(String),
+    /// The analytics endpoint rejected the query body (usually a bad metric or
+    /// a time range past the 367-day cap).
+    BadQuery(String),
     /// The configured base URL would send the key in cleartext.
     InsecureBase(String),
 }
@@ -59,6 +65,7 @@ impl fmt::Display for ApiError {
             Self::Status(code) => write!(f, "OpenRouter returned HTTP {code}"),
             Self::Network(msg) => write!(f, "network error: {msg}"),
             Self::Decode(msg) => write!(f, "unexpected response: {msg}"),
+            Self::BadQuery(msg) => write!(f, "analytics query rejected: {msg}"),
             Self::InsecureBase(base) => write!(
                 f,
                 "refusing to send the management key to {base} in cleartext — use https (plain http is allowed only for localhost)"
@@ -123,12 +130,7 @@ pub fn fetch_credits(agent: &Agent, api_base: &str, api_key: &str) -> Result<Cre
 
     // 64 KiB is far more than {"data":{...}} needs and keeps a hostile or broken
     // server from streaming until memory runs out.
-    let body = response
-        .body_mut()
-        .with_config()
-        .limit(64 * 1024)
-        .read_to_string()
-        .map_err(|err| ApiError::Network(err.to_string()))?;
+    let body = read_body(response.body_mut())?;
     parse(&body)
 }
 
@@ -149,6 +151,81 @@ fn parse(body: &str) -> Result<Credits, ApiError> {
         total_credits: envelope.data.total_credits,
         total_usage: envelope.data.total_usage,
     })
+}
+
+fn read_body(response: &mut ureq::Body) -> Result<String, ApiError> {
+    response
+        .with_config()
+        .limit(BODY_LIMIT)
+        .read_to_string()
+        .map_err(|err| ApiError::Network(err.to_string()))
+}
+
+/// Credits consumed between two instants, from `POST /api/v1/analytics/query`.
+///
+/// The query is an aggregate: no `granularity`, so the server sums the range
+/// instead of bucketing it into UTC days. That keeps the window edges exact —
+/// a local-midnight start is not rounded back to the previous UTC midnight.
+/// `credits_usage` is the metric that moves the balance: every charge billed to
+/// credits, including BYOK platform fees.
+pub fn fetch_spend(
+    agent: &Agent,
+    api_base: &str,
+    api_key: &str,
+    start: &str,
+    end: &str,
+) -> Result<f64, ApiError> {
+    check_base(api_base)?;
+    let url = format!("{}/analytics/query", api_base.trim().trim_end_matches('/'));
+    let payload = serde_json::json!({
+        "metrics": ["credits_usage"],
+        "time_range": { "start": start, "end": end },
+    })
+    .to_string();
+
+    let request = agent
+        .post(&url)
+        .header("Authorization", &format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json");
+
+    let mut response = match request.send(payload.as_str()) {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(401)) => return Err(ApiError::Unauthorized),
+        Err(ureq::Error::StatusCode(403)) => return Err(ApiError::Forbidden),
+        Err(ureq::Error::StatusCode(400)) => {
+            // The body carries the reason; a bare 400 is useless in the UI.
+            return Err(ApiError::BadQuery("bad time range or metric".into()));
+        }
+        Err(ureq::Error::StatusCode(code)) => return Err(ApiError::Status(code)),
+        Err(err) => return Err(ApiError::Network(err.to_string())),
+    };
+
+    let body = read_body(response.body_mut())?;
+    parse_spend(&body)
+}
+
+fn parse_spend(body: &str) -> Result<f64, ApiError> {
+    #[derive(Deserialize)]
+    struct Envelope {
+        data: Data,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        #[serde(default)]
+        data: Vec<Row>,
+    }
+    #[derive(Deserialize)]
+    struct Row {
+        #[serde(default)]
+        credits_usage: f64,
+    }
+
+    let envelope: Envelope =
+        serde_json::from_str(body).map_err(|err| ApiError::Decode(err.to_string()))?;
+    // No dimensions were requested, so this is one row — but summing keeps a
+    // future shape change from silently reporting only part of the window.
+    Ok(envelope.data.data.iter().map(|row| row.credits_usage).sum())
 }
 
 #[cfg(test)]
@@ -222,5 +299,26 @@ mod tests {
         };
         assert_eq!(credits.used_fraction(), Some(1.0));
         assert!((credits.remaining() + 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sums_aggregate_spend_rows() {
+        let body = r#"{"data":{"data":[{"credits_usage":5.684795}],"metadata":{"row_count":1,"truncated":false}}}"#;
+        assert!((parse_spend(body).unwrap() - 5.684795).abs() < 1e-9);
+    }
+
+    #[test]
+    fn empty_window_spends_nothing() {
+        assert_eq!(parse_spend(r#"{"data":{"data":[]}}"#).unwrap(), 0.0);
+        assert_eq!(parse_spend(r#"{"data":{"data":[{}]}}"#).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn rejects_a_malformed_query_response() {
+        assert!(matches!(
+            parse_spend(r#"{"error":{"code":400}}"#),
+            Err(ApiError::Decode(_))
+        ));
+        assert!(matches!(parse_spend("<html>"), Err(ApiError::Decode(_))));
     }
 }

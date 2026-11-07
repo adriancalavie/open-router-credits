@@ -1,6 +1,7 @@
 //! Value formatting shared by the TUI and the `--once` report.
 
 use crate::api::Credits;
+use crate::range::Range;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
@@ -31,6 +32,24 @@ fn group_thousands(digits: &str) -> String {
 
 pub fn percent(fraction: f64) -> String {
     format!("{:.1}%", fraction * 100.0)
+}
+
+/// Spend per day, the window-mode replacement for a share: a percentage of
+/// lifetime purchases stops meaning anything once that total grows.
+pub fn rate(per_day: f64) -> String {
+    // Two decimals read as money; four made the column look like a measurement
+    // ($0.9719/d). Only sub-cent rates earn a third digit.
+    let decimals = if per_day.abs() < 0.01 { 3 } else { 2 };
+    format!("${per_day:.decimals$}/d")
+}
+
+/// Days until the balance runs out at the current rate.
+pub fn days(days: f64) -> String {
+    match days {
+        d if d >= 999.0 => "999+ d".to_string(),
+        d if d >= 10.0 => format!("{d:.0} d"),
+        d => format!("{d:.1} d"),
+    }
 }
 
 /// Color used for a "remaining" reading: green, amber, red as the balance drops.
@@ -80,30 +99,70 @@ pub fn masked_key(key: &str) -> String {
     format!("{head}…{tail}")
 }
 
-/// Plain-text report used by `--once`.
-pub fn report(credits: &Credits) -> String {
+/// Plain-text report used by `--once`. `spend` is the amount consumed inside
+/// `range`; `Range::All` and `Range::Session` read from the lifetime counters.
+pub fn report(credits: &Credits, range: Range, spend: Option<f64>) -> String {
     let used = credits.used_fraction().unwrap_or(0.0);
     let remaining = credits.remaining_fraction().unwrap_or(0.0);
-    let rows = [
-        ("Purchased", credits.total_credits, 1.0),
-        ("Used", credits.total_usage, used),
-        ("Remaining", credits.remaining(), remaining),
-    ];
+    let purchased = credits.total_credits;
+
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<11} {:>12}  {:>7}  {}\n",
-        "METRIC", "USD", "SHARE", "BAR"
+        "{:<20} {:>12}  {:>7}  {}\n",
+        "METRIC",
+        "USD",
+        if range == Range::All { "SHARE" } else { "RATE" },
+        "BAR"
     ));
-    for (label, amount, fraction) in rows {
+
+    if range != Range::All {
+        let window = spend.unwrap_or(0.0);
+        let span = days_in(range);
+        let per_day = span.filter(|d| *d > 1.0 / 24.0).map(|d| window / d);
+        let runway = per_day
+            .filter(|rate| *rate > 0.0)
+            .map(|rate| credits.remaining() / rate);
         out.push_str(&format!(
-            "{:<11} {:>12}  {:>7}  {}\n",
-            label,
+            "{:<20} {:>12}  {:>7}\n",
+            format!("Used · {}", range.label()),
+            money(window),
+            per_day.map(rate).unwrap_or_else(|| "—".into()),
+        ));
+        out.push_str(&format!(
+            "{:<20} {:>12}  {:>7}  {}\n",
+            "Remaining",
+            money(credits.remaining()),
+            runway.map(days).unwrap_or_else(|| "—".into()),
+            bar_text(remaining, 24),
+        ));
+        return out;
+    }
+
+    let rows = [
+        ("Purchased".to_string(), purchased, Some(1.0)),
+        ("Used".to_string(), credits.total_usage, Some(used)),
+        (
+            "Remaining".to_string(),
+            credits.remaining(),
+            Some(remaining),
+        ),
+    ];
+
+    for (label, amount, fraction) in rows {
+        let bar = fraction.map(|f| bar_text(f, 24)).unwrap_or_default();
+        let share = fraction.map(percent).unwrap_or_else(|| "—".into());
+        out.push_str(&format!(
+            "{label:<20} {:>12}  {share:>7}  {bar}\n",
             money(amount),
-            percent(fraction),
-            bar_text(fraction, 24)
         ));
     }
     out
+}
+
+/// Length of a window in days, using the same local-time rules as the TUI.
+fn days_in(range: Range) -> Option<f64> {
+    let (start, end) = range.window(chrono::Local::now())?;
+    Some((end - start).num_seconds().max(0) as f64 / 86_400.0)
 }
 
 #[cfg(test)]
