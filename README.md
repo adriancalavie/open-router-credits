@@ -1,6 +1,9 @@
 # open-router-credits
 
 [![CI](https://github.com/adriancalavie/open-router-credits/actions/workflows/rust.yml/badge.svg?branch=main&label=CI)](https://github.com/adriancalavie/open-router-credits/actions/workflows/rust.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg?logo=rust)](Cargo.toml)
+[![lines](https://img.shields.io/badge/lines-3.1k-blue.svg)](src)
 
 Shows your OpenRouter credit balance in the terminal.
 
