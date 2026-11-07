@@ -358,8 +358,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     ))
     .right_aligned();
 
-    frame.render_widget(Paragraph::new(left), area);
-    frame.render_widget(Paragraph::new(right), area);
+    frame.render_widget(Paragraph::new(left.clone()), area);
+    // Two paragraphs share this line. On a narrow terminal the right-aligned
+    // half would land on top of the keys, so drop it rather than jumble them.
+    // One column of air keeps the two halves readable.
+    let needed = left.width() as u16 + right.width() as u16 + 1;
+    if needed <= area.width {
+        frame.render_widget(Paragraph::new(right), area);
+    }
 }
 
 fn draw_error(frame: &mut Frame, area: Rect, app: &App) {
@@ -787,6 +793,20 @@ mod tests {
     fn degrades_gracefully_on_small_terminal() {
         let screen = render(&app(None), 40, 8);
         assert!(screen.contains("too small"), "{screen}");
+    }
+
+    /// The keys survive on a narrow terminal; the freshness text steps aside
+    /// instead of printing over them.
+    #[test]
+    fn the_footer_drops_the_age_rather_than_collide() {
+        let app = app(Some(Credits {
+            total_credits: 100.5,
+            total_usage: 25.75,
+        }));
+        assert!(render(&app, 90, 24).contains("auto 60s"));
+        let narrow = render(&app, 60, 24);
+        assert!(narrow.contains("0-7 window"), "{narrow}");
+        assert!(!narrow.contains("auto 60s"), "{narrow}");
     }
 
     /// Structure must never be drawn in palette slots that themes remap:

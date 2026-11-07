@@ -14,7 +14,7 @@ Shows your OpenRouter credit balance in the terminal.
 │                                                                          │
 │[█████████████████████████████████████████████░░░░░░░░░░░░░░░] 74.4% left │
 │                                                                          │
-│ q quit    r refresh    ? help               updated just now · auto 60s  │
+│ q quit    0-7 window    r refresh    ? help   updated 4s ago · auto 60s  │
 │                                                                          │
 ╰──────────────────────────────────────────────────────────────────────────╯
 ```
@@ -72,50 +72,26 @@ Press `q` to quit, `r` to refresh, `0`-`7` to switch the window, and `?` for hel
 
 ## Windows
 
-The default view is lifetime: purchased, used, remaining. A window replaces the "Used" row
-with what you spent inside it, and swaps the share column for a rate:
-
-```
-METRIC                                                      USD       RATE
-Used · this week                                          $5.68    $0.97/d
-Remaining                                                 $3.50      3.6 d
-```
-
-A rate is used because a percentage of lifetime purchases stops meaning anything as the total
-grows: $5 out of $10 000 spent is 0.05% and tells you nothing. The rate says "about a dollar a
-day, and the balance lasts three and a half days at that pace". Both numbers come from the
-window you picked, so a quiet year average is not the same as a busy week — the title says
-which one you are looking at.
+`0`-`7` or `--range` switch between lifetime totals and a window.
 
 | key | window | starts at |
 | --- | --- | --- |
-| `0` | all time | nothing, lifetime totals |
-| `1` | this session | when the panel started, no query |
+| `0` | all time | lifetime totals |
+| `1` | this session | panel start, no query |
 | `2` | this week | Monday 00:00 local |
 | `3` | last 7 days | rolling |
 | `4` | this month | the 1st, local |
 | `5` | last 30 days | rolling |
-| `6` | this quarter | the quarter's first day, local |
+| `6` | this quarter | quarter start, local |
 | `7` | this year | 1 January, local |
 
-In the lifetime view `SHARE` is a slice of everything you ever purchased. In a window that
-column becomes `RATE`: dollars per day for the spend row, days of balance left for the
-remaining row.
+A window shows what you spent inside it, and swaps `SHARE` for `RATE`: dollars per day, and
+days of balance left at that rate. The bar becomes what is left of the money that moved in the
+window, `remaining / (spent + remaining)`. Lifetime keeps the purchase share.
 
-The bar changes with the view too. Lifetime, it reads "how much of everything I bought is
-left". In a window it reads "how much of the money that moved inside this window is still
-there": remaining / (spent + remaining). Spent $5.68 since Monday with $3.50 left in the
-account, and $9.18 moved through the window, so 38.1% of it is left.
-
-Each window is one `POST /api/v1/analytics/query` with an exact start and end instant, so a
-window begins at your local midnight, not at a UTC day boundary. Windows refresh every five
-minutes; the balance refreshes every `refresh_secs`. Nothing is stored on disk.
-
-Two limits come from the API, not from this tool:
-
-- There is no endpoint for top-ups or for a past balance. A window reports what you spent,
-  and the balance is always the current one.
-- The server keeps 367 days of daily data, which covers "this year" but not earlier.
+Each window is one `POST /analytics/query` with exact instants, so it starts at local midnight,
+not at UTC. Cached in memory for five minutes. The API has no top-up or past-balance data and
+only reaches back 367 days, so a window never claims a starting balance.
 
 ## Configuration
 
